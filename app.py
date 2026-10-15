@@ -208,24 +208,20 @@ def get_layer_metadata(service, layer_id):
 @st.cache_data(ttl=3600, show_spinner=False)
 def query_features(service, layer_id, where="1=1", bbox_web=None):
     """
-    Retrieve ArcGIS features with pagination.
-    Geometry is returned in British National Grid (EPSG:27700).
+    Retrieve ArcGIS features in object-ID batches.
+    This avoids resultOffset pagination, which some services
+    do not support.
     """
     url = arcgis_url(service, layer_id)
 
-    params = {
+    base_params = {
         "f": "json",
         "where": where,
-        "outFields": "*",
-        "returnGeometry": "true",
-        "outSR": 27700,
-        "resultRecordCount": PAGE_SIZE,
-        "resultOffset": 0,
     }
 
     if bbox_web is not None:
         xmin, ymin, xmax, ymax = bbox_web
-        params.update({
+        base_params.update({
             "geometry": json.dumps({
                 "xmin": xmin,
                 "ymin": ymin,
@@ -238,26 +234,44 @@ def query_features(service, layer_id, where="1=1", bbox_web=None):
             "spatialRel": "esriSpatialRelIntersects",
         })
 
+    # First ask ArcGIS for the matching feature IDs.
+    id_params = dict(base_params)
+    id_params.update({
+        "returnIdsOnly": "true",
+        "returnGeometry": "false",
+    })
+
+    id_result = request_json(url, id_params)
+    object_ids = id_result.get("objectIds")
+
+    if object_ids is None:
+        raise RuntimeError(
+            f"Layer {layer_id} did not return object IDs. "
+            "Check the layer query endpoint and permissions."
+        )
+
+    if not object_ids:
+        return []
+
+    # Query manageable batches without using resultOffset.
     all_features = []
-    offset = 0
+    batch_size = 200
 
-    for _ in range(100):
-        params["resultOffset"] = offset
-        payload = request_json(url, params)
-        features = payload.get("features", [])
-        all_features.extend(features)
+    for start in range(0, len(object_ids), batch_size):
+        batch_ids = object_ids[start:start + batch_size]
 
-        if not features:
-            break
+        feature_params = {
+            "f": "json",
+            "objectIds": ",".join(map(str, batch_ids)),
+            "outFields": "*",
+            "returnGeometry": "true",
+            "outSR": 27700,
+        }
 
-        exceeded = payload.get("exceededTransferLimit", False)
-        if not exceeded and len(features) < PAGE_SIZE:
-            break
-
-        offset += len(features)
+        payload = request_json(url, feature_params)
+        all_features.extend(payload.get("features", []))
 
     return all_features
-
 
 def features_to_records(features):
     records = []
